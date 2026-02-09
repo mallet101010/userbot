@@ -27,12 +27,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from io import BytesIO
 from collections import defaultdict
+from typing import Dict, List, Optional
 
 from telethon import TelegramClient, events, functions, types
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.channels import JoinChannelRequest, LeaveChannelRequest
+from telethon.tl.functions.messages import ExportChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest
 
-from flask import Flask
+from flask import Flask, request
 import waitress
 
 # ==================== КОНФИГУРАЦИЯ ====================
@@ -58,6 +61,7 @@ DB_PATH = Path('userbot.db')
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = conn.cursor()
 
+# Все таблицы
 tables = [
     '''CREATE TABLE IF NOT EXISTS notes (name TEXT PRIMARY KEY, content TEXT)''',
     '''CREATE TABLE IF NOT EXISTS warns (user_id INTEGER, chat_id INTEGER, count INTEGER)''',
@@ -66,12 +70,30 @@ tables = [
     '''CREATE TABLE IF NOT EXISTS welcome (chat_id INTEGER PRIMARY KEY, text TEXT)''',
     '''CREATE TABLE IF NOT EXISTS rules (chat_id INTEGER PRIMARY KEY, text TEXT)''',
     '''CREATE TABLE IF NOT EXISTS filters (name TEXT PRIMARY KEY, text TEXT)''',
-    '''CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, chat_id INTEGER, time INTEGER, text TEXT)'''
+    '''CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, chat_id INTEGER, time INTEGER, text TEXT)''',
+    '''CREATE TABLE IF NOT EXISTS deleted_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, user_id INTEGER, text TEXT, timestamp INTEGER)''',
+    '''CREATE TABLE IF NOT EXISTS edited_messages (id INTEGER PRIMARY KEY, chat_id INTEGER, user_id INTEGER, old_text TEXT, new_text TEXT, timestamp INTEGER)''',
+    '''CREATE TABLE IF NOT EXISTS tag_alerts (user_id INTEGER PRIMARY KEY, enabled INTEGER DEFAULT 1)''',
+    '''CREATE TABLE IF NOT EXISTS autograb_channels (source_channel TEXT, target_channel TEXT)''',
+    '''CREATE TABLE IF NOT EXISTS autojoin_links (link TEXT PRIMARY KEY)''',
+    '''CREATE TABLE IF NOT EXISTS autodelete_messages (message_id INTEGER, chat_id INTEGER, delete_time INTEGER)''',
+    '''CREATE TABLE IF NOT EXISTS captcha_whitelist (bot_id INTEGER PRIMARY KEY)'''
 ]
 
 for table in tables:
     cursor.execute(table)
 conn.commit()
+
+# ==================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ====================
+SETTINGS = {
+    'ghost_mode': False,
+    'tag_alerts_enabled': True,
+    'autograb_enabled': False,
+    'autojoin_enabled': False,
+    'antidelete_enabled': True,
+    'autocaptcha_enabled': False,
+    'autoread_enabled': True
+}
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 async def is_admin(chat_id, user_id):
@@ -88,6 +110,25 @@ async def http_get(url):
             return response.read().decode('utf-8')
     return await asyncio.to_thread(sync_get)
 
+async def http_post(url, data):
+    def sync_post():
+        req = urllib.request.Request(url, data=data.encode(), headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return response.read().decode('utf-8')
+    return await asyncio.to_thread(sync_post)
+
+def clean_message(text):
+    """Удаление рекламы и ссылок"""
+    # Удаление ссылок
+    text = re.sub(r'https?://\S+', '', text)
+    # Удаление упоминаний рекламных ботов
+    text = re.sub(r'@(promo|advert|spam|реклама|объявление)\w*', '', text, flags=re.IGNORECASE)
+    # Удаление ключевых слов рекламы
+    ads_keywords = ['купить', 'продать', 'скидка', 'акция', 'реклама', 'заказать', 'доставка']
+    for word in ads_keywords:
+        text = re.sub(fr'\b{word}\b.*?\.', '', text, flags=re.IGNORECASE)
+    return text.strip()
+
 # ==================== МЕНЮ КОМАНД ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.м$'))
 async def menu(event):
@@ -99,42 +140,42 @@ async def menu(event):
 .и - информация
 .р - работа
 .id - ID чата
-.инфо @user - информация о пользователе
+.инфо @user - информация
 .заметки - список заметок
-.заметка имя текст - добавить заметку
-.получить имя - получить заметку
-.удалить имя - удалить заметку
+.заметка имя текст - добавить
+.получить имя - получить
+.удалить имя - удалить
 .бан @user - забанить
 .разбан @user - разбанить
 .кик @user - кикнуть
-.мут @user N - мут на N минут
+.мут @user N - мут N минут
 .размут @user - снять мут
-.закрепить - закрепить сообщение
+.закрепить - закрепить
 .открепить - открепить
-.очистить N - удалить N сообщений
+.очистить N - удалить N
 .варн @user - предупреждение
-.варны @user - проверка варнов
-.снять @user - снять варны
+.варны @user - проверить
+.снять @user - снять все
 .погода город - погода
 .кальк выражение - калькулятор
 .кр текст - QR код
-.сократить url - сократить ссылку
-.расширить url - расширить ссылку
-.реверс текст - перевернуть текст
-.транслит текст - транслитерация
+.сократить url - сократить
+.расширить url - расширить
+.реверс текст - перевернуть
+.транслит текст - транслит
 .лит текст - leet speak
 .верх текст - верхний регистр
-.низ текст - нижний регистр
-.жирный текст - жирный текст
+.низ текст - нижний
+.жирный текст - жирный
 .моно текст - моноширинный
 .курсив текст - курсив
-.пузырь текст - пузырьковый текст
+.пузырь текст - пузырьковый
 .антиспам добавить слово - добавить фильтр
-.антиспам удалить слово - удалить фильтр
-.антиспам список - список фильтров
-.привет текст - установить приветствие
-.правила текст - установить правила
-.админы - список администраторов
+.антиспам удалить слово - удалить
+.антиспам список - список
+.привет текст - приветствие
+.правила текст - правила
+.админы - список админов
 .все - тег всех
 .пригласить N - создать приглашение
 .биткоин - курс BTC
@@ -143,34 +184,34 @@ async def menu(event):
 .солана - курс SOL
 .доги - курс DOGE
 .валюта из в сумма - конвертация
-.поиск запрос - поиск в Google
-.вики запрос - поиск в Википедии
+.поиск запрос - Google
+.вики запрос - Википедия
 .в2а - видео в аудио
-.озвучить текст - текст в речь
+.озвучить текст - TTS
 .картинка запрос - поиск картинок
 .пароль N - генератор паролей
 .случайный N - случайное число
 .кубик - бросить кубик
-.монетка - подбросить монетку
+.монетка - монетка
 .шар вопрос - шар предсказаний
-.афк причина - режим AFK
+.афк причина - AFK режим
 .неафк - выйти из AFK
-.клонировать @user - клонировать профиль
+.клонировать @user - клонировать
 .экспорт - экспорт пользователей
 .система - системная информация
 .логи - просмотр логов
-.перезапуск - перезапуск бота
-.стоп - остановка бота
-.сохранить текст - сохранить в избранное
-.переслать @user текст - переслать сообщение
-.блок @user - заблокировать пользователя
+.перезапуск - перезапуск
+.стоп - остановка
+.сохранить текст - сохранить
+.переслать @user текст - переслать
+.блок @user - заблокировать
 .разблок @user - разблокировать
 .войти ссылка - войти в чат
 .выйти - выйти из чата
 .жалоба @user причина - пожаловаться
 .статистика - статистика чата
 .парсинг - парсинг участников
-.найти @user - найти чаты пользователя
+.найти @user - найти чаты
 .поискчаты текст - поиск в чатах
 .слова - топ слов
 .фейк - фейковые данные
@@ -185,49 +226,49 @@ async def menu(event):
 .замьютить - мьют всех
 .размьютить - размьют всех
 .закрыть - закрыть чат
-.открыть - открыть чат
+.открыть - открыть
 .ссылка - получить ссылку
-.удалитьфото - удалить фото чата
+.удалитьфото - удалить фото
 .установитьфото - установить фото
 .название текст - изменить название
 .описание текст - изменить описание
-.история N - история сообщений
+.история N - история
 .найтисообщение текст - найти сообщение
-.получитьсообщение id - получить сообщение
-.удалитьсообщение id - удалить сообщение
-.изменить текст - изменить сообщение
+.получитьсообщение id - получить
+.удалитьсообщение id - удалить
+.изменить текст - изменить
 .реакция эмодзи - реакция
 .прочитано - отметить прочитанным
 .непрочитано - отметить непрочитанным
-.архив - архивировать чат
+.архив - архивировать
 .разархив - разархивировать
 .закрепитьсообщение - закрепить
 .открепитьсообщение - открепить
 .файл - информация о файле
 .скачать - скачать медиа
-.загрузить файл - загрузить файл
+.загрузить файл - загрузить
 .стикеры - создать набор
-.добавитьстикер - добавить стикер
-.удалитьстикер - удалить стикер
+.добавитьстикер - добавить
+.удалитьстикер - удалить
 .шрифты - список шрифтов
 .шрифт имя текст - текст шрифтом
 .шифровать текст - шифрование
 .дешифровать текст - дешифрование
 .хэш текст - хэш
-.base64 текст - base64 кодировка
-.unbase64 текст - base64 декодировка
-.urlencode текст - url кодировка
-.urldecode текст - url декодировка
+.base64 текст - base64
+.unbase64 текст - base64 декод
+.urlencode текст - url encode
+.urldecode текст - url decode
 .json данные - форматирование json
-.xml данные - форматирование xml
-.csv данные - форматирование csv
-.yaml данные - форматирование yaml
-.hex текст - в hex
-.unhex текст - из hex
-.bin текст - в binary
-.unbin текст - из binary
-.morse текст - в морзе
-.unmorse текст - из морзе
+.xml данные - xml
+.csv данные - csv
+.yaml данные - yaml
+.hex текст - hex
+.unhex текст - unhex
+.bin текст - binary
+.unbin текст - unbinary
+.morse текст - morse
+.unmorse текст - unmorse
 .ascii текст - ascii art
 .binary текст - binary art
 .qrcode текст - qr код
@@ -239,23 +280,302 @@ async def menu(event):
 .напомнить N текст - напоминание
 .будильник ЧЧ:ММ - будильник
 .задача добавить задача - добавить задачу
-.задача список - список задач
-.задача удалить N - удалить задачу
-.задача очистить - очистить все
-.опрос вопрос вар1 вар2 - создать опрос
+.задача список - список
+.задача удалить N - удалить
+.задача очистить - очистить
+.опрос вопрос вар1 вар2 - опрос
 .голосовать - голосовать
-.результаты - результаты опроса
-.игра - начать игру
-.викторина - вопрос викторины
-.виселица - игра виселица
-.квиз - квиз"""
+.результаты - результаты
+.игра - игра
+.викторина - викторина
+.виселица - виселица
+.квиз - квиз
+.граббер добавить источник цель - добавить граббер
+.граббер список - список грабберов
+.граббер удалить источник - удалить
+.граббер вкл - включить граббер
+.граббер выкл - выключить
+.тегалерт вкл - включить тег-алерт
+.тегалерт выкл - выключить
+.автокапча вкл - включить автокапчу
+.автокапча выкл - выключить
+.автовступление добавить ссылка - добавить ссылку
+.автовступление список - список
+.автовступление удалить ссылка - удалить
+.автовступление вкл - включить
+.автовступление выкл - выключить
+.антиудаление вкл - включить антиудаление
+.антиудаление выкл - выключить
+.антиудаление лог - показать логи
+.самоуничтожение N текст - самоуничтожение
+.призрак вкл - режим призрака
+.призрак выкл - выключить
+.настройки - показать настройки"""
     await event.edit(text, parse_mode='md')
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.х$'))
 async def help_all(event):
     text = """**Все команды**
-.м .х .п .в .с .и .р .id .инфо .заметки .заметка .получить .удалить .бан .разбан .кик .мут .размут .закрепить .открепить .очистить .варн .варны .снять .погода .кальк .кр .сократить .расширить .реверс .транслит .лит .верх .низ .жирный .моно .курсив .пузырь .антиспам .привет .правила .админы .все .пригласить .биткоин .эфир .тон .солана .доги .валюта .поиск .вики .в2а .озвучить .картинка .пароль .случайный .кубик .монетка .шар .афк .неафк .клонировать .экспорт .система .логи .перезапуск .стоп .сохранить .переслать .блок .разблок .войти .выйти .жалоба .статистика .парсинг .найти .поискчаты .слова .фейк .цитата .кто .повысить .понизить .кикмен .я .админвсе .скриншот .замьютить .размьютить .закрыть .открыть .ссылка .удалитьфото .установитьфото .название .описание .история .найтисообщение .получитьсообщение .удалитьсообщение .изменить .реакция .прочитано .непрочитано .архив .разархив .закрепитьсообщение .открепитьсообщение .файл .скачать .загрузить .стикеры .добавитьстикер .удалитьстикер .шрифты .шрифт .шифровать .дешифровать .хэш .base64 .unbase64 .urlencode .urldecode .json .xml .csv .yaml .hex .unhex .bin .unbin .morse .unmorse .ascii .binary .qrcode .barcode .график .календарь .таймер .секундомер .напомнить .будильник .задача .опрос .голосовать .результаты .игра .викторина .виселица .квиз"""
+.м .х .п .в .с .и .р .id .инфо .заметки .заметка .получить .удалить .бан .разбан .кик .мут .размут .закрепить .открепить .очистить .варн .варны .снять .погода .кальк .кр .сократить .расширить .реверс .транслит .лит .верх .низ .жирный .моно .курсив .пузырь .антиспам .привет .правила .админы .все .пригласить .биткоин .эфир .тон .солана .доги .валюта .поиск .вики .в2а .озвучить .картинка .пароль .случайный .кубик .монетка .шар .афк .неафк .клонировать .экспорт .система .логи .перезапуск .стоп .сохранить .переслать .блок .разблок .войти .выйти .жалоба .статистика .парсинг .найти .поискчаты .слова .фейк .цитата .кто .повысить .понизить .кикмен .я .админвсе .скриншот .замьютить .размьютить .закрыть .открыть .ссылка .удалитьфото .установитьфото .название .описание .история .найтисообщение .получитьсообщение .удалитьсообщение .изменить .реакция .прочитано .непрочитано .архив .разархив .закрепитьсообщение .открепитьсообщение .файл .скачать .загрузить .стикеры .добавитьстикер .удалитьстикер .шрифты .шрифт .шифровать .дешифровать .хэш .base64 .unbase64 .urlencode .urldecode .json .xml .csv .yaml .hex .unhex .bin .unbin .morse .unmorse .ascii .binary .qrcode .barcode .график .календарь .таймер .секундомер .напомнить .будильник .задача .опрос .голосовать .результаты .игра .викторина .виселица .квиз .граббер .тегалерт .автокапча .автовступление .антиудаление .самоуничтожение .призрак .настройки"""
     await event.edit(text, parse_mode='md')
+
+# ==================== НОВЫЕ ФУНКЦИИ ====================
+
+# 1. Граббер контента
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.граббер добавить (.+) (.+)$'))
+async def add_grabber(event):
+    source = event.pattern_match.group(1).strip()
+    target = event.pattern_match.group(2).strip()
+    cursor.execute('INSERT OR REPLACE INTO autograb_channels VALUES (?, ?)', (source, target))
+    conn.commit()
+    await event.edit(f'**Граббер добавлен:** {source} → {target}')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.граббер список$'))
+async def list_grabbers(event):
+    cursor.execute('SELECT source_channel, target_channel FROM autograb_channels')
+    rows = cursor.fetchall()
+    if rows:
+        text = '**Грабберы:**\n' + '\n'.join([f'{src} → {tgt}' for src, tgt in rows])
+    else:
+        text = '**Нет грабберов**'
+    await event.edit(text)
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.граббер вкл$'))
+async def enable_grabber(event):
+    SETTINGS['autograb_enabled'] = True
+    await event.edit('**Граббер включен**')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.граббер выкл$'))
+async def disable_grabber(event):
+    SETTINGS['autograb_enabled'] = False
+    await event.edit('**Граббер выключен**')
+
+@client.on(events.NewMessage(incoming=True))
+async def auto_grabber(event):
+    if SETTINGS['autograb_enabled'] and event.chat:
+        cursor.execute('SELECT target_channel FROM autograb_channels WHERE source_channel = ?', (str(event.chat.id),))
+        rows = cursor.fetchall()
+        for row in rows:
+            target_channel = row[0]
+            try:
+                # Очищаем сообщение от рекламы
+                clean_text = clean_message(event.text) if event.text else ""
+                if event.media and clean_text:
+                    await client.send_file(target_channel, event.media, caption=clean_text)
+                elif clean_text:
+                    await client.send_message(target_channel, clean_text)
+            except:
+                pass
+
+# 2. Tag Alert
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.тегалерт вкл$'))
+async def enable_tag_alert(event):
+    SETTINGS['tag_alerts_enabled'] = True
+    cursor.execute('INSERT OR REPLACE INTO tag_alerts VALUES (?, 1)', (event.sender_id,))
+    conn.commit()
+    await event.edit('**Тег-алерт включен**')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.тегалерт выкл$'))
+async def disable_tag_alert(event):
+    SETTINGS['tag_alerts_enabled'] = False
+    cursor.execute('INSERT OR REPLACE INTO tag_alerts VALUES (?, 0)', (event.sender_id,))
+    conn.commit()
+    await event.edit('**Тег-алерт выключен**')
+
+@client.on(events.NewMessage(incoming=True))
+async def tag_alert_handler(event):
+    if SETTINGS['tag_alerts_enabled'] and event.text:
+        me = await client.get_me()
+        # Проверяем упоминания
+        if f'@{me.username}' in event.text or me.first_name in event.text or me.id in event.text:
+            alert_text = f'**Вас упомянули в {event.chat.title if event.chat else "чате"}**\nОт: {event.sender.first_name}\nТекст: {event.text[:100]}...'
+            await client.send_message('me', alert_text)
+
+# 3. Автокапча
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.автокапча вкл$'))
+async def enable_autocaptcha(event):
+    SETTINGS['autocaptcha_enabled'] = True
+    await event.edit('**Автокапча включена**')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.автокапча выкл$'))
+async def disable_autocaptcha(event):
+    SETTINGS['autocaptcha_enabled'] = False
+    await event.edit('**Автокапча выключена**')
+
+@client.on(events.NewMessage(incoming=True))
+async def autocaptcha_handler(event):
+    if SETTINGS['autocaptcha_enabled'] and event.sender and event.sender.bot:
+        text = event.text or ""
+        # Математическая капча
+        if '2+2' in text or '3+3' in text or '4+4' in text:
+            await asyncio.sleep(1)
+            if '2+2' in text:
+                await event.reply('4')
+            elif '3+3' in text:
+                await event.reply('6')
+            elif '4+4' in text:
+                await event.reply('8')
+        # Подтверждение
+        elif 'подтверди' in text.lower() or 'verify' in text.lower():
+            await asyncio.sleep(1)
+            await event.reply('✅')
+        # Кнопки
+        elif event.reply_markup:
+            await asyncio.sleep(2)
+            try:
+                await event.click(0)
+            except:
+                pass
+
+# 4. Автовступление
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.автовступление добавить (.+)$'))
+async def add_autojoin_link(event):
+    link = event.pattern_match.group(1).strip()
+    cursor.execute('INSERT OR IGNORE INTO autojoin_links VALUES (?)', (link,))
+    conn.commit()
+    await event.edit(f'**Ссылка добавлена:** {link}')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.автовступление список$'))
+async def list_autojoin_links(event):
+    cursor.execute('SELECT link FROM autojoin_links')
+    rows = cursor.fetchall()
+    if rows:
+        text = '**Ссылки:**\n' + '\n'.join([row[0] for row in rows])
+    else:
+        text = '**Нет ссылок**'
+    await event.edit(text)
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.автовступление вкл$'))
+async def enable_autojoin(event):
+    SETTINGS['autojoin_enabled'] = True
+    await event.edit('**Автовступление включено**')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.автовступление выкл$'))
+async def disable_autojoin(event):
+    SETTINGS['autojoin_enabled'] = False
+    await event.edit('**Автовступление выключено**')
+
+async def autojoin_task():
+    while True:
+        if SETTINGS['autojoin_enabled']:
+            cursor.execute('SELECT link FROM autojoin_links')
+            rows = cursor.fetchall()
+            for row in rows:
+                link = row[0]
+                try:
+                    if 't.me/joinchat/' in link or 't.me/+' in link:
+                        # Приватная ссылка
+                        invite_hash = link.split('/')[-1]
+                        await client(ImportChatInviteRequest(invite_hash))
+                    elif 't.me/' in link:
+                        # Публичный канал/чат
+                        username = link.split('t.me/')[-1].replace('@', '')
+                        await client(JoinChannelRequest(username))
+                    await asyncio.sleep(5)
+                except:
+                    pass
+        await asyncio.sleep(60)
+
+# 5. Анти-удаление
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.антиудаление вкл$'))
+async def enable_antidelete(event):
+    SETTINGS['antidelete_enabled'] = True
+    await event.edit('**Анти-удаление включено**')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.антиудаление выкл$'))
+async def disable_antidelete(event):
+    SETTINGS['antidelete_enabled'] = False
+    await event.edit('**Анти-удаление выключено**')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.антиудаление лог$'))
+async def show_deleted_log(event):
+    cursor.execute('SELECT chat_id, user_id, text, timestamp FROM deleted_messages ORDER BY timestamp DESC LIMIT 10')
+    rows = cursor.fetchall()
+    if rows:
+        text = '**Удаленные сообщения:**\n'
+        for chat_id, user_id, msg_text, timestamp in rows:
+            time_str = datetime.fromtimestamp(timestamp).strftime('%H:%M')
+            text += f'[{time_str}] {user_id}: {msg_text[:50]}...\n'
+    else:
+        text = '**Нет записей**'
+    await event.edit(text)
+
+@client.on(events.MessageDeleted)
+async def deleted_message_handler(event):
+    if SETTINGS['antidelete_enabled']:
+        for msg_id in event.deleted_ids:
+            try:
+                msg = await client.get_messages(event.chat_id, ids=msg_id)
+                if msg:
+                    cursor.execute('INSERT INTO deleted_messages (chat_id, user_id, text, timestamp) VALUES (?, ?, ?, ?)',
+                                 (event.chat_id, msg.sender_id, msg.text or "", int(time.time())))
+                    conn.commit()
+                    
+                    # Отправляем в избранное
+                    alert = f'**Удалено сообщение в {event.chat.title if event.chat else "чате"}**\nОт: {msg.sender_id}\nТекст: {msg.text[:200]}...'
+                    await client.send_message('me', alert)
+            except:
+                pass
+
+@client.on(events.MessageEdited)
+async def edited_message_handler(event):
+    if SETTINGS['antidelete_enabled'] and event.old_message:
+        cursor.execute('INSERT INTO edited_messages (chat_id, user_id, old_text, new_text, timestamp) VALUES (?, ?, ?, ?, ?)',
+                     (event.chat_id, event.sender_id, event.old_message.text or "", event.message.text or "", int(time.time())))
+        conn.commit()
+
+# 6. Self-Destruct
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.самоуничтожение (\d+) (.+)$'))
+async def self_destruct(event):
+    seconds = int(event.pattern_match.group(1))
+    text = event.pattern_match.group(2).strip()
+    
+    msg = await event.edit(f'**Самоуничтожение через {seconds}с:** {text}')
+    
+    async def delete_later():
+        await asyncio.sleep(seconds)
+        try:
+            await msg.delete()
+            # Пытаемся удалить у собеседника если это ЛС
+            if event.is_private:
+                async for other_msg in client.iter_messages(event.chat_id, limit=1):
+                    if other_msg.text == text:
+                        await other_msg.delete()
+        except:
+            pass
+    
+    asyncio.create_task(delete_later())
+
+# 7. Ghost Mode
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.призрак вкл$'))
+async def enable_ghost_mode(event):
+    SETTINGS['ghost_mode'] = True
+    await event.edit('**Режим призрака включен**')
+
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.призрак выкл$'))
+async def disable_ghost_mode(event):
+    SETTINGS['ghost_mode'] = False
+    await event.edit('**Режим призрака выключен**')
+
+@client.on(events.NewMessage(incoming=True))
+async def ghost_mode_handler(event):
+    if SETTINGS['ghost_mode'] and not event.out:
+        # Просмотр без отметки "прочитано"
+        try:
+            await client(functions.messages.ReadMessageContentsRequest(
+                id=[event.id],
+                peer=event.chat_id
+            ))
+        except:
+            pass
+
+# 8. Настройки
+@client.on(events.NewMessage(outgoing=True, pattern=r'^\.настройки$'))
+async def show_settings(event):
+    text = '**Настройки:**\n'
+    for key, value in SETTINGS.items():
+        text += f'{key}: {"ВКЛ" if value else "ВЫКЛ"}\n'
+    await event.edit(text)
 
 # ==================== ОСНОВНЫЕ КОМАНДЫ ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.п$'))
@@ -318,7 +638,7 @@ async def get_id(event):
 async def user_info(event):
     try:
         user = await client.get_entity(event.pattern_match.group(1).strip())
-        text = f"""**Информация о пользователе**
+        text = f"""**Информация**
 ID: {user.id}
 Имя: {user.first_name or ''}
 Фамилия: {user.last_name or ''}
@@ -564,7 +884,6 @@ async def qr_code(event):
     except:
         await event.edit('**Ошибка**')
 
-# ==================== ССЫЛКИ ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.сократить (.+)$'))
 async def shorten_url(event):
     url = event.pattern_match.group(1).strip()
@@ -587,7 +906,6 @@ async def unshorten_url(event):
     except:
         await event.edit('**Ошибка**')
 
-# ==================== ТЕКСТОВЫЕ УТИЛИТЫ ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.реверс (.+)$'))
 async def reverse_text(event):
     text = event.pattern_match.group(1).strip()
@@ -646,7 +964,6 @@ async def bubble_text(event):
     result = ''.join(bubble_dict.get(c.lower(), c) for c in text)
     await event.edit(f'**Пузырьковый:** {result}')
 
-# ==================== ГРУППОВЫЕ ФИШКИ ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.антиспам добавить (.+)$'))
 async def antispam_add(event):
     if not event.is_group:
@@ -682,16 +999,6 @@ async def antispam_list(event):
     else:
         text = '**Нет фильтров**'
     await event.edit(text)
-
-@client.on(events.NewMessage(incoming=True))
-async def check_spam(event):
-    if event.is_group and event.text:
-        cursor.execute('SELECT pattern FROM spam_filters WHERE chat_id = ?', (event.chat_id,))
-        patterns = [row[0] for row in cursor.fetchall()]
-        for pattern in patterns:
-            if re.search(pattern, event.text, re.IGNORECASE):
-                await event.delete()
-                break
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.привет (.+)$'))
 async def welcome_set(event):
@@ -776,7 +1083,6 @@ async def generate_invite(event):
     
     try:
         usage_limit = int(event.pattern_match.group(1))
-        from telethon.tl.functions.messages import ExportChatInviteRequest
         result = await client(ExportChatInviteRequest(
             peer=event.chat_id,
             expire_date=None,
@@ -786,7 +1092,6 @@ async def generate_invite(event):
     except:
         await event.edit('**Ошибка**')
 
-# ==================== КРИПТА ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.биткоин$'))
 async def bitcoin_price(event):
     try:
@@ -851,7 +1156,6 @@ async def convert_currency(event):
     except:
         await event.edit('**Ошибка**')
 
-# ==================== ДОПОЛНИТЕЛЬНЫЕ КОМАНДЫ ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.поиск (.+)$'))
 async def google_search(event):
     query = event.pattern_match.group(1).strip()
@@ -939,7 +1243,6 @@ async def magic_ball(event):
     answers = ['Да', 'Нет', 'Возможно', 'Спроси позже', 'Определённо', 'Никогда', 'Вероятно', 'Сомнительно']
     await event.edit(f'**Ответ:** {random.choice(answers)}')
 
-# ==================== AFK СИСТЕМА ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.афк (.+)$'))
 async def set_afk(event):
     reason = event.pattern_match.group(1).strip()
@@ -953,20 +1256,6 @@ async def unset_afk(event):
     conn.commit()
     await event.edit('**AFK отключен**')
 
-@client.on(events.NewMessage(incoming=True))
-async def check_afk(event):
-    if event.is_private and not event.out:
-        cursor.execute('SELECT reason, time FROM afk WHERE user_id = ?', (event.sender_id,))
-        row = cursor.fetchone()
-        if row:
-            reason, since_time = row
-            since = datetime.fromtimestamp(since_time)
-            delta = datetime.now() - since
-            hours = delta.seconds // 3600
-            minutes = (delta.seconds % 3600) // 60
-            await event.respond(f'**Пользователь AFK:** {reason}\n**Время:** {hours}ч {minutes}м')
-
-# ==================== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ====================
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.клонировать (.+)$'))
 async def clone_profile(event):
     try:
@@ -1100,7 +1389,6 @@ async def join_chat(event):
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.выйти$'))
 async def leave_chat(event):
     try:
-        from telethon.tl.functions.channels import LeaveChannelRequest
         await client(LeaveChannelRequest(event.chat_id))
     except:
         await event.edit('**Нельзя выйти**')
@@ -1207,10 +1495,6 @@ async def search_chats(event):
         await event.edit(text)
     else:
         await event.edit('**Не найдено**')
-
-@client.on(events.NewMessage(outgoing=True, pattern=r'^\.слова$'))
-async def top_words(event):
-    await event.edit('**Топ слов не реализован**')
 
 @client.on(events.NewMessage(outgoing=True, pattern=r'^\.фейк$'))
 async def fake_data(event):
@@ -1345,6 +1629,9 @@ async def start_bot():
     print(f"Бот запущен: @{me.username or me.id}")
     print(f"Время запуска: {client.start_time}")
     print(f"Flask сервер на порту {PORT}")
+    
+    # Запуск фоновых задач
+    asyncio.create_task(autojoin_task())
     
     def run_flask():
         waitress.serve(app, host='0.0.0.0', port=PORT)
